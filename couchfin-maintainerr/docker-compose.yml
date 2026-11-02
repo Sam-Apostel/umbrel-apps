@@ -1,0 +1,49 @@
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      # <app-id>_<service>_1
+      APP_HOST: couchfin-maintainerr_web_1
+      APP_PORT: 6246
+      # Maintainerr has no login of its own: keep Umbrel's login in front of it.
+
+  web:
+    image: ghcr.io/maintainerr/maintainerr:3.31.0@sha256:33d86e5f03ed25204788b1e9cd9a2b3f0299cf49fae968220484b57008962399
+    # The image runs as the "node" user (uid 1000) and keeps all state in /opt/data.
+    user: "1000:1000"
+    environment:
+      TELEMETRY: "off"
+    volumes:
+      - ${APP_DATA_DIR}/data/maintainerr:/opt/data
+    restart: on-failure
+
+  # Wires Maintainerr to the official Sonarr, Radarr and Seerr apps, then
+  # waits for the Jellyfin API key and creates the "Leaving soon" rules once
+  # (in "Do nothing" mode). Reuses the Maintainerr image (it ships Node), so
+  # there is no extra image to trust or update. Exits when done.
+  configurator:
+    image: ghcr.io/maintainerr/maintainerr:3.31.0@sha256:33d86e5f03ed25204788b1e9cd9a2b3f0299cf49fae968220484b57008962399
+    user: "1000:1000"
+    entrypoint: ["node", "/couchfin/configure.mjs"]
+    depends_on:
+      - web
+    environment:
+      MAINTAINERR_URL: "http://couchfin-maintainerr_web_1:6246"
+      SONARR_URL: "http://sonarr_server_1:8989"
+      SONARR_API_KEY: ${APP_COUCHFIN_MAINTAINERR_SONARR_API_KEY:-}
+      RADARR_URL: "http://radarr_server_1:7878"
+      RADARR_API_KEY: ${APP_COUCHFIN_MAINTAINERR_RADARR_API_KEY:-}
+      SEERR_URL: "http://jellyseerr_server_1:5055"
+      SEERR_API_KEY: ${APP_COUCHFIN_MAINTAINERR_SEERR_API_KEY:-}
+      JELLYFIN_URL: "http://jellyfin_server_1:8096"
+      # Defaults for the rules created on first run (edit them in Maintainerr later).
+      DISK_USAGE_PERCENT: "80"
+      WATCHED_DAYS: "14"
+      LEAVING_SOON_DAYS: "7"
+      STATE_DIR: "/state"
+    volumes:
+      # Rendered by umbrelOS from configure.mjs.template on install/start/update.
+      - ${APP_DATA_DIR}/configure.mjs:/couchfin/configure.mjs:ro
+      - ${APP_DATA_DIR}/data/configurator:/state
+    restart: on-failure

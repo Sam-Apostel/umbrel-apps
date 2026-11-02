@@ -1,0 +1,56 @@
+manifestVersion: 1
+id: couchfin-maintainerr
+storage:
+  dataRoot: data
+category: media
+name: Maintainerr
+version: "3.31.0"
+tagline: Frees up disk space by clearing out media everyone has watched
+icon: https://raw.githubusercontent.com/Maintainerr/Maintainerr/v3.31.0/apps/ui/public/logo_icon.svg
+description: >-
+  One step after installing: open Maintainerr, go to Settings > Jellyfin, enter
+  http://jellyfin_server_1:8096 as the URL and paste an API key created in Jellyfin under
+  Dashboard > API Keys. Sonarr, Radarr and Seerr are connected automatically (their API keys are
+  read from the official Umbrel apps, nothing to paste).
+
+
+  A few minutes after Jellyfin is connected, Couchfin adds a "Leaving soon" rule per Jellyfin
+  library. A movie or a TV season is picked when:
+
+
+  - everyone in the household (all Jellyfin users) has watched it,
+
+  - the last time anyone watched it is at least 14 days ago,
+
+  - nobody marked it as a favourite (for seasons: also not the show),
+
+  - for seasons: the season has finished airing,
+
+  - and the media disk is more than 80% full.
+
+
+  Picked media appears in a "Leaving soon" collection in Jellyfin (and Couchfin). The rules start in
+  "Do nothing" mode, so nothing is deleted until you change the rule's action to "Unmonitor and
+  delete files" (movies) or "Unmonitor and delete season" (TV). Media is then removed through
+  Radarr/Sonarr 7 days after it entered the collection, unmonitored so it is not downloaded again,
+  and its Seerr request is cleared so it can be requested again later.
+releaseNotes: ""
+
+developer: Maintainerr
+website: https://maintainerr.info
+dependencies:
+  - jellyfin
+  - sonarr
+  - radarr
+repo: https://github.com/Maintainerr/Maintainerr
+support: https://github.com/Maintainerr/Maintainerr/issues
+
+port: 6246
+gallery: []
+path: ""
+
+defaultUsername: ""
+defaultPassword: ""
+
+submitter: Sam Apostel
+submission: https://github.com/sam-apostel/umbrel-apps

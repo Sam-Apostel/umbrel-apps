@@ -1,0 +1,58 @@
+manifestVersion: 1
+id: couchfin-cleanuparr
+storage:
+  dataRoot: data
+category: media
+name: Cleanuparr
+version: "2.10.12"
+tagline: Removes fake, malware and stuck downloads, then searches again
+icon: https://raw.githubusercontent.com/Cleanuparr/Cleanuparr/v2.10.12/Logo/256.png
+description: >-
+  Preconfigured for the official Umbrel Sonarr, Radarr and Transmission apps. On first start it
+  connects to them by itself (it reads the Sonarr and Radarr API keys from their config, so there is
+  nothing to paste) and logs you in as "umbrel" with the password shown on this page.
+
+
+  What it does out of the box:
+
+
+  - Malware Blocker: every few seconds it checks what Sonarr and Radarr are downloading in Transmission.
+  Files on Cleanuparr's official blacklist (.iso, .exe, .lnk, archives, samples, ...) are skipped.
+  When nothing usable is left in a torrent, it is removed from Transmission, blocklisted in Sonarr or
+  Radarr, and a search for the next release starts automatically.
+
+
+  - Failed imports: when Sonarr or Radarr can't import a finished download because it has no usable
+  video, the download gets a strike. After 3 strikes it is removed, blocklisted and searched again.
+
+
+  - Private-tracker torrents are left alone, and Cleanuparr never goes looking for upgrades on its own
+  (proactive search stays off), so it won't fill your disk.
+
+
+  Change anything later in Cleanuparr's settings; the automatic setup only runs once and never
+  overwrites your changes.
+releaseNotes: ""
+
+developer: Cleanuparr
+website: https://cleanuparr.github.io/Cleanuparr/
+dependencies:
+  - sonarr
+  - radarr
+  - transmission
+repo: https://github.com/Cleanuparr/Cleanuparr
+support: https://github.com/Cleanuparr/Cleanuparr/issues
+
+port: 11011
+gallery:
+  - https://raw.githubusercontent.com/Cleanuparr/Cleanuparr/v2.10.12/docs/static/img/screenshots/dashboard.webp
+  - https://raw.githubusercontent.com/Cleanuparr/Cleanuparr/v2.10.12/docs/static/img/screenshots/events.webp
+  - https://raw.githubusercontent.com/Cleanuparr/Cleanuparr/v2.10.12/docs/static/img/screenshots/download_clients.webp
+path: ""
+
+defaultUsername: "umbrel"
+defaultPassword: ""
+deterministicPassword: true
+
+submitter: Sam Apostel
+submission: https://github.com/sam-apostel/umbrel-apps

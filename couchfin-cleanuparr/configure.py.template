@@ -1,0 +1,279 @@
+# Couchfin configurator for Cleanuparr.
+#
+# Runs once next to Cleanuparr (same image, it ships python3) and wires it to
+# the official Umbrel Sonarr, Radarr and Transmission apps through
+# Cleanuparr's own REST API:
+#
+#   1. creates the Cleanuparr login (user "umbrel", password = the Umbrel app
+#      password shown on the app's page) if nobody has set one up yet,
+#   2. adds Sonarr + Radarr (API keys read from their config.xml by exports.sh)
+#      and Transmission,
+#   3. turns on the Malware Blocker (official blacklist: .iso, .exe, archives,
+#      samples, ...) and the Queue Cleaner's failed-import strikes, so a bad
+#      grab is removed, blocklisted in the *arr and a new search is started
+#      (Cleanuparr's "replacement search", on by default; its "proactive
+#      search", which would hunt for upgrades and fill the disk, stays off).
+#
+# It never overwrites settings after the first successful run (marker file in
+# /state). This file is an Umbrel template: it must not contain a dollar sign.
+
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+BASE = os.environ.get("CLEANUPARR_URL", "http://localhost:11011").rstrip("/")
+USERNAME = os.environ.get("CLEANUPARR_USERNAME", "umbrel")
+PASSWORD = os.environ.get("CLEANUPARR_PASSWORD", "")
+STATE_DIR = os.environ.get("STATE_DIR", "/state")
+MARKER = os.path.join(STATE_DIR, "configured-v1")
+FEATURES_MARKER = os.path.join(STATE_DIR, "features-v1")
+BLACKLIST_URL = os.environ.get(
+    "BLACKLIST_URL",
+    "https://raw.githubusercontent.com/Cleanuparr/Cleanuparr/main/blacklist",
+)
+FAILED_IMPORT_PATTERNS = [
+    # Messages Sonarr/Radarr show when a grab contains no usable video.
+    "No files found are eligible for import",
+    "Sample",
+    "Unable to determine if file is a sample",
+    "No audio tracks detected",
+    "executable file",
+    "potentially dangerous file",
+]
+
+
+def log(message):
+    print("[couchfin-configurator] " + message, flush=True)
+
+
+def request(method, path, body=None, token=None, base=BASE, api_key=None):
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(base + path, data=data, method=method)
+    req.add_header("Accept", "application/json")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
+    if api_key:
+        req.add_header("X-Api-Key", api_key)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            raw = response.read()
+            status = response.status
+    except urllib.error.HTTPError as error:
+        raw = error.read()
+        status = error.code
+    try:
+        payload = json.loads(raw) if raw else None
+    except ValueError:
+        payload = raw.decode("utf-8", "replace")
+    return status, payload
+
+
+def ci_get(obj, key, default=None):
+    """Case-insensitive dict lookup (the API is camelCase, be tolerant)."""
+    if not isinstance(obj, dict):
+        return default
+    for k, v in obj.items():
+        if k.lower() == key.lower():
+            return v
+    return default
+
+
+def ci_set(obj, key, value):
+    for k in list(obj.keys()):
+        if k.lower() == key.lower():
+            obj[k] = value
+            return
+    obj[key] = value
+
+
+def wait_for(url_base, path, what, api_key=None, attempts=120, delay=5):
+    for _ in range(attempts):
+        try:
+            status, _ = request("GET", path, base=url_base, api_key=api_key)
+            if status == 200:
+                return True
+        except Exception:  # connection refused while the app boots
+            pass
+        time.sleep(delay)
+    log("gave up waiting for " + what)
+    return False
+
+
+def login():
+    status, payload = request("GET", "/api/auth/status")
+    if status != 200:
+        raise RuntimeError("auth status returned " + str(status))
+    if not ci_get(payload, "setupCompleted"):
+        if not PASSWORD:
+            raise RuntimeError("no APP_PASSWORD available to create the login")
+        status, payload = request(
+            "POST",
+            "/api/auth/setup/account",
+            {"username": USERNAME, "password": PASSWORD},
+        )
+        if status == 409:
+            log("someone is completing the setup wizard by hand; leaving it alone")
+            return None
+        if status not in (200, 201):
+            raise RuntimeError("creating account failed: " + str(status) + " " + str(payload))
+        status, payload = request("POST", "/api/auth/setup/complete")
+        if status not in (200, 201):
+            raise RuntimeError("completing setup failed: " + str(status) + " " + str(payload))
+        log("created Cleanuparr login '" + USERNAME + "' (password = Umbrel app password)")
+
+    status, payload = request(
+        "POST", "/api/auth/login", {"username": USERNAME, "password": PASSWORD}
+    )
+    if status != 200:
+        log("could not log in as '" + USERNAME + "' (HTTP " + str(status) + "). "
+            "The login was changed by hand, so automatic setup is skipped.")
+        return None
+    if ci_get(payload, "requiresTwoFactor"):
+        log("2FA is enabled on the login; automatic setup is skipped")
+        return None
+    return ci_get(ci_get(payload, "tokens"), "accessToken")
+
+
+def ensure_arr(token, kind, name, url, api_key, version, external_url):
+    if not api_key:
+        log("no " + name + " API key found (is the official " + name + " app installed "
+            "and started once?). Skipping " + name + "; restart this app later to retry.")
+        return False
+    status, payload = request("GET", "/api/configuration/" + kind, token=token)
+    if status != 200:
+        raise RuntimeError("reading " + kind + " config failed: " + str(status))
+    for instance in ci_get(payload, "instances", []) or []:
+        if str(ci_get(instance, "url", "")).rstrip("/") == url.rstrip("/"):
+            log(name + " already configured")
+            return True
+    body = {
+        "enabled": True,
+        "name": name,
+        "url": url,
+        "apiKey": api_key,
+        "version": version,
+    }
+    if external_url:
+        body["externalUrl"] = external_url
+    status, payload = request("POST", "/api/configuration/" + kind + "/instances", body, token=token)
+    if status not in (200, 201):
+        raise RuntimeError("adding " + name + " failed: " + str(status) + " " + str(payload))
+    log("added " + name + " at " + url)
+    return True
+
+
+def ensure_transmission(token, host, external_url):
+    status, payload = request("GET", "/api/configuration/download_client", token=token)
+    if status != 200:
+        raise RuntimeError("reading download clients failed: " + str(status))
+    for client in ci_get(payload, "clients", []) or []:
+        if str(ci_get(client, "typeName", "")).lower() == "transmission":
+            log("Transmission already configured")
+            return
+    body = {
+        "enabled": True,
+        "name": "Transmission",
+        "typeName": "Transmission",
+        "host": host,
+        "urlBase": "transmission",
+    }
+    if external_url:
+        body["externalUrl"] = external_url
+    status, payload = request("POST", "/api/configuration/download_client", body, token=token)
+    if status not in (200, 201):
+        raise RuntimeError("adding Transmission failed: " + str(status) + " " + str(payload))
+    log("added Transmission at " + host)
+
+
+def configure_malware_blocker(token):
+    status, config = request("GET", "/api/configuration/malware_blocker", token=token)
+    if status != 200 or not isinstance(config, dict):
+        raise RuntimeError("reading malware blocker failed: " + str(status))
+    ci_set(config, "enabled", True)
+    ci_set(config, "ignorePrivate", True)
+    blocklist = {"enabled": True, "blocklistType": "Blacklist", "blocklistPath": BLACKLIST_URL}
+    ci_set(config, "sonarr", blocklist)
+    ci_set(config, "radarr", dict(blocklist))
+    status, payload = request("PUT", "/api/configuration/malware_blocker", config, token=token)
+    if status != 200:
+        raise RuntimeError("saving malware blocker failed: " + str(status) + " " + str(payload))
+    log("Malware Blocker enabled for Sonarr + Radarr (" + BLACKLIST_URL + ")")
+
+
+def configure_queue_cleaner(token):
+    status, config = request("GET", "/api/configuration/queue_cleaner", token=token)
+    if status != 200 or not isinstance(config, dict):
+        raise RuntimeError("reading queue cleaner failed: " + str(status))
+    failed_import = ci_get(config, "failedImport") or {}
+    ci_set(failed_import, "maxStrikes", 3)
+    ci_set(failed_import, "ignorePrivate", True)
+    ci_set(failed_import, "deletePrivate", False)
+    ci_set(failed_import, "skipIfNotFoundInClient", True)
+    ci_set(failed_import, "patterns", FAILED_IMPORT_PATTERNS)
+    ci_set(failed_import, "patternMode", "Include")
+    ci_set(failed_import, "changeCategory", False)
+    ci_set(config, "failedImport", failed_import)
+    ci_set(config, "enabled", True)
+    status, payload = request("PUT", "/api/configuration/queue_cleaner", config, token=token)
+    if status != 200:
+        raise RuntimeError("saving queue cleaner failed: " + str(status) + " " + str(payload))
+    log("Queue Cleaner enabled: failed imports with no usable video get 3 strikes")
+
+
+def write_marker(path):
+    with open(path, "w") as marker:
+        marker.write(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + "\n")
+
+
+def main():
+    if os.path.exists(MARKER):
+        log("already configured on an earlier start; nothing to do")
+        return 0
+    if not wait_for(BASE, "/health", "Cleanuparr"):
+        return 1
+    token = login()
+    if not token:
+        return 0
+
+    ok = True
+    ok &= ensure_arr(
+        token, "sonarr", "Sonarr",
+        os.environ.get("SONARR_URL", "http://sonarr_server_1:8989"),
+        os.environ.get("SONARR_API_KEY", "").strip(), 4,
+        os.environ.get("SONARR_EXTERNAL_URL", ""),
+    )
+    ok &= ensure_arr(
+        token, "radarr", "Radarr",
+        os.environ.get("RADARR_URL", "http://radarr_server_1:7878"),
+        os.environ.get("RADARR_API_KEY", "").strip(), 6,
+        os.environ.get("RADARR_EXTERNAL_URL", ""),
+    )
+    ensure_transmission(
+        token,
+        os.environ.get("TRANSMISSION_URL", "http://transmission_server_1:9091"),
+        os.environ.get("TRANSMISSION_EXTERNAL_URL", ""),
+    )
+    if not os.path.exists(FEATURES_MARKER):
+        configure_malware_blocker(token)
+        configure_queue_cleaner(token)
+        write_marker(FEATURES_MARKER)
+
+    if ok:
+        write_marker(MARKER)
+        log("done")
+    else:
+        log("finished with warnings; will retry the missing parts on the next start")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as error:  # keep the container log readable
+        log("error: " + str(error))
+        sys.exit(1)

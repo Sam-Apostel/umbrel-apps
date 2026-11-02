@@ -1,0 +1,31 @@
+name: Validate apps
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: pip install yamllint==1.35.1 pyyaml==6.0.2
+
+      - name: yamllint
+        run: yamllint --strict .
+
+      - name: Store and manifest checks
+        run: python3 .github/scripts/validate.py
+
+      - name: exports.sh syntax
+        run: for f in */exports.sh; do bash -n "$f"; done

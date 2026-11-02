@@ -1,0 +1,52 @@
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      # <app-id>_<service>_1
+      APP_HOST: couchfin-cleanuparr_web_1
+      APP_PORT: 11011
+
+  web:
+    image: ghcr.io/cleanuparr/cleanuparr:2.10.12@sha256:d0212e4c66bd0522e23c5e5da5d3006bd5ff0e0de1e3ecfcf892e039d55721e2
+    # The entrypoint supports rootless mode; /config is owned by 1000:1000.
+    user: "1000:1000"
+    environment:
+      PORT: 11011
+    volumes:
+      - ${APP_DATA_DIR}/data/config:/config
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:11011/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+  # One-shot: wires Cleanuparr to the official Sonarr, Radarr and Transmission
+  # apps through Cleanuparr's REST API. Reuses the Cleanuparr image (it ships
+  # python3), so there is no extra image to trust or update.
+  configurator:
+    image: ghcr.io/cleanuparr/cleanuparr:2.10.12@sha256:d0212e4c66bd0522e23c5e5da5d3006bd5ff0e0de1e3ecfcf892e039d55721e2
+    user: "1000:1000"
+    entrypoint: ["python3", "/couchfin/configure.py"]
+    depends_on:
+      - web
+    environment:
+      CLEANUPARR_URL: "http://couchfin-cleanuparr_web_1:11011"
+      CLEANUPARR_USERNAME: "umbrel"
+      CLEANUPARR_PASSWORD: ${APP_PASSWORD}
+      SONARR_URL: "http://sonarr_server_1:8989"
+      SONARR_API_KEY: ${APP_COUCHFIN_CLEANUPARR_SONARR_API_KEY:-}
+      SONARR_EXTERNAL_URL: "http://${DEVICE_DOMAIN_NAME}:8989"
+      RADARR_URL: "http://radarr_server_1:7878"
+      RADARR_API_KEY: ${APP_COUCHFIN_CLEANUPARR_RADARR_API_KEY:-}
+      RADARR_EXTERNAL_URL: "http://${DEVICE_DOMAIN_NAME}:7878"
+      TRANSMISSION_URL: "http://transmission_server_1:9091"
+      TRANSMISSION_EXTERNAL_URL: "http://${DEVICE_DOMAIN_NAME}:9091"
+      STATE_DIR: "/state"
+    volumes:
+      # Rendered by umbrelOS from configure.py.template on install/start/update.
+      - ${APP_DATA_DIR}/configure.py:/couchfin/configure.py:ro
+      - ${APP_DATA_DIR}/data/configurator:/state
+    restart: on-failure
