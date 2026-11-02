@@ -6,7 +6,7 @@ category: media
 name: Cleanuparr
 version: "2.10.12"
 tagline: Removes fake, malware and stuck downloads, then searches again
-icon: https://raw.githubusercontent.com/Cleanuparr/Cleanuparr/v2.10.12/Logo/256.png
+icon: https://raw.githubusercontent.com/Sam-Apostel/umbrel-apps/master/couchfin-cleanuparr/icon.svg
 description: >-
   Preconfigured for the official Umbrel Sonarr, Radarr and Transmission apps. On first start it
   connects to them by itself (it reads the Sonarr and Radarr API keys from their config, so there is

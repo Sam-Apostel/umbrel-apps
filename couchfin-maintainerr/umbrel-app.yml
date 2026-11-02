@@ -6,7 +6,7 @@ category: media
 name: Maintainerr
 version: "3.31.0"
 tagline: Frees up disk space by clearing out media everyone has watched
-icon: https://raw.githubusercontent.com/Maintainerr/Maintainerr/v3.31.0/apps/ui/public/logo_icon.svg
+icon: https://raw.githubusercontent.com/Sam-Apostel/umbrel-apps/master/couchfin-maintainerr/icon.svg
 description: >-
   One step after installing: open Maintainerr, go to Settings > Jellyfin, enter
   http://jellyfin_server_1:8096 as the URL and paste an API key created in Jellyfin under
