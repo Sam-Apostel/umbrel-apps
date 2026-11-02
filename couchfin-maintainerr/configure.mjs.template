@@ -1,0 +1,265 @@
+// Couchfin configurator for Maintainerr.
+//
+// Runs next to Maintainerr (same image, it ships Node) and wires it to the
+// official Umbrel apps through Maintainerr's own REST API:
+//
+//   1. adds Sonarr + Radarr (API keys read from their config.xml by exports.sh)
+//      and Seerr (API key read from its settings.json), if they are missing,
+//   2. waits until the owner has pasted a Jellyfin API key in Maintainerr
+//      (the one manual step: Jellyfin keeps its keys in its database),
+//   3. creates the "Leaving soon" rules once, in safe mode: matching media is
+//      only shown in a Jellyfin collection, nothing is deleted until the owner
+//      switches the rule's action (see the README).
+//
+// This file is an Umbrel template: it must not contain a dollar sign, so it
+// uses string concatenation instead of template literals.
+
+import { existsSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+
+const env = process.env
+const trimSlash = (url) => (url.endsWith('/') ? url.slice(0, -1) : url)
+const BASE = trimSlash(env.MAINTAINERR_URL || 'http://localhost:6246')
+const STATE_DIR = env.STATE_DIR || '/state'
+const RULES_MARKER = join(STATE_DIR, 'rules-created-v1')
+const DISK_USAGE_PERCENT = Number(env.DISK_USAGE_PERCENT || 80)
+const WATCHED_DAYS = Number(env.WATCHED_DAYS || 14)
+const LEAVING_SOON_DAYS = Number(env.LEAVING_SOON_DAYS || 7)
+const DO_NOTHING = 4 // ServarrAction.DO_NOTHING: show in the collection only
+const GIB = 1024 * 1024 * 1024
+
+const log = (message) => console.log('[couchfin-configurator] ' + message)
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+async function api(method, path, body, base, headers) {
+  const response = await fetch((base || BASE) + path, {
+    method,
+    headers: Object.assign(
+      { Accept: 'application/json' },
+      body === undefined ? {} : { 'Content-Type': 'application/json' },
+      headers || {},
+    ),
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(60000),
+  })
+  const text = await response.text()
+  let data = text
+  try {
+    data = text ? JSON.parse(text) : null
+  } catch {
+    // keep the raw text
+  }
+  if (!response.ok) {
+    throw new Error(method + ' ' + path + ' -> HTTP ' + response.status + ' ' + text.slice(0, 300))
+  }
+  return data
+}
+
+async function waitForMaintainerr() {
+  for (let i = 0; i < 120; i++) {
+    try {
+      await api('GET', '/api/settings/version')
+      return
+    } catch {
+      await sleep(5000)
+    }
+  }
+  throw new Error('Maintainerr did not come up')
+}
+
+async function ensureArr(kind, name, url, apiKey) {
+  if (!apiKey) {
+    log('no ' + name + ' API key found (is the official ' + name + ' app installed and started once?). Skipping; restart this app later to retry.')
+    return false
+  }
+  const servers = await api('GET', '/api/settings/' + kind)
+  if (Array.isArray(servers) && servers.length > 0) {
+    log(name + ' already configured')
+    return true
+  }
+  const result = await api('POST', '/api/settings/' + kind, { serverName: name, url, apiKey })
+  if (result && result.code === 0) throw new Error('adding ' + name + ' failed: ' + JSON.stringify(result))
+  log('added ' + name + ' at ' + url)
+  return true
+}
+
+async function ensureSeerr(url, apiKey) {
+  if (!apiKey) {
+    log('Seerr not found (optional): requests will not be cleared after deletion')
+    return
+  }
+  const current = await api('GET', '/api/settings/seerr')
+  if (current && current.url) {
+    log('Seerr already configured')
+    return
+  }
+  const result = await api('POST', '/api/settings/seerr', { url, api_key: apiKey })
+  if (result && result.code === 0) throw new Error('adding Seerr failed: ' + JSON.stringify(result))
+  log('added Seerr at ' + url)
+}
+
+async function jellyfinReady() {
+  const settings = await api('GET', '/api/settings')
+  return Boolean(settings && settings.media_server_type === 'jellyfin' && settings.jellyfin_api_key)
+}
+
+// Free-space threshold in GiB on the disk that holds /downloads, read from
+// the *arr itself so it matches what Maintainerr's disk-space rule sees.
+async function diskThreshold(arrUrl, apiKey) {
+  const disks = await api('GET', '/api/v3/diskspace', undefined, arrUrl, { 'X-Api-Key': apiKey })
+  if (!Array.isArray(disks) || disks.length === 0) throw new Error('no disk information from ' + arrUrl)
+  const disk =
+    disks.find((d) => d.path === '/downloads') ||
+    disks.slice().sort((a, b) => (b.totalSpace || 0) - (a.totalSpace || 0))[0]
+  const freeGiB = Math.max(1, Math.round(((disk.totalSpace || 0) * (100 - DISK_USAGE_PERCENT)) / 100 / GIB))
+  return { path: disk.path, freeGiB, totalGiB: Math.round((disk.totalSpace || 0) / GIB) }
+}
+
+function movieRules(users, disk) {
+  return {
+    mediaType: 'MOVIES',
+    rules: [
+      {
+        0: [
+          { firstValue: 'Jellyfin.seenBy', action: 'CONTAINS_ALL', customValue: { type: 'TEXT_LIST', value: JSON.stringify(users) } },
+          { operator: 'AND', firstValue: 'Jellyfin.lastViewedAt', action: 'BEFORE', customValue: { type: 'CUSTOM_DAYS', value: WATCHED_DAYS } },
+          { operator: 'AND', firstValue: 'Jellyfin.favoritedBy', action: 'COUNT_EQUALS', customValue: { type: 'NUMBER', value: 0 } },
+          { operator: 'AND', firstValue: 'Radarr.diskspace_remaining_gb', action: 'SMALLER', customValue: { type: 'NUMBER', value: disk.freeGiB }, arrDiskPath: disk.path },
+        ],
+      },
+    ],
+  }
+}
+
+function seasonRules(users, disk) {
+  return {
+    mediaType: 'SEASONS',
+    rules: [
+      {
+        0: [
+          { firstValue: 'Jellyfin.sw_allEpisodesSeenBy', action: 'CONTAINS_ALL', customValue: { type: 'TEXT_LIST', value: JSON.stringify(users) } },
+          { operator: 'AND', firstValue: 'Jellyfin.sw_lastWatched', action: 'BEFORE', customValue: { type: 'CUSTOM_DAYS', value: WATCHED_DAYS } },
+          { operator: 'AND', firstValue: 'Jellyfin.sw_favoritedBy_including_parent', action: 'COUNT_EQUALS', customValue: { type: 'NUMBER', value: 0 } },
+          { operator: 'AND', firstValue: 'Sonarr.unaired_episodes', action: 'EQUALS', customValue: { type: 'BOOLEAN', value: 'false' } },
+          { operator: 'AND', firstValue: 'Sonarr.diskspace_remaining_gb', action: 'SMALLER', customValue: { type: 'NUMBER', value: disk.freeGiB }, arrDiskPath: disk.path },
+        ],
+      },
+    ],
+  }
+}
+
+async function decode(ruleDocument, mediaType) {
+  // JSON is valid YAML; Maintainerr's importer resolves names like
+  // "Jellyfin.seenBy" to its internal ids, so no ids are hard-coded here.
+  const result = await api('POST', '/api/rules/yaml/decode', { yaml: JSON.stringify(ruleDocument), mediaType })
+  if (!result || result.code !== 1) throw new Error('rule import failed: ' + JSON.stringify(result))
+  if (result.skipped) throw new Error('rule import skipped ' + result.skipped + ' rule(s)')
+  return JSON.parse(result.result).rules
+}
+
+async function createRuleGroup(library, dataType, rules, servers) {
+  const name = 'Leaving soon: ' + library.title
+  const body = Object.assign(
+    {
+      libraryId: library.id,
+      name,
+      description:
+        'Created by Couchfin. Watched by everyone at least ' + WATCHED_DAYS + ' days ago, not a favourite, ' +
+        'and the media disk is more than ' + DISK_USAGE_PERCENT + '% full. Starts in "Do nothing" mode.',
+      isActive: true,
+      useRules: true,
+      dataType,
+      arrAction: DO_NOTHING,
+      forceSeerr: true,
+      listExclusions: false,
+      rules,
+      collection: { deleteAfterDays: LEAVING_SOON_DAYS, keepLogsForMonths: 6 },
+    },
+    servers,
+  )
+  await api('POST', '/api/rules', body)
+  log('created rule group "' + name + '" (Do nothing / leaving-soon only)')
+}
+
+async function createRules(radarrKey, sonarrKey) {
+  const existing = (await api('GET', '/api/rules')) || []
+  const existingNames = new Set(existing.map((group) => group.name))
+  const ours = existing.filter((group) => String(group.name).startsWith('Leaving soon: '))
+  if (existing.length > ours.length) {
+    log('you already have your own rules; not adding the Couchfin defaults')
+    return true
+  }
+  const users = await api('GET', '/api/rules/users')
+  if (!Array.isArray(users) || users.length === 0) {
+    log('no Jellyfin users visible yet')
+    return false
+  }
+  log('household = all Jellyfin users: ' + users.join(', '))
+  const libraries = await api('GET', '/api/media-server/libraries')
+  const radarr = (await api('GET', '/api/settings/radarr'))[0]
+  const sonarr = (await api('GET', '/api/settings/sonarr'))[0]
+
+  for (const library of libraries || []) {
+    if (existingNames.has('Leaving soon: ' + library.title)) {
+      log('rule group for "' + library.title + '" already exists')
+    } else if (library.type === 'movie' && radarr && radarrKey) {
+      const disk = await diskThreshold(radarr.url, radarrKey)
+      log('movies: act when less than ' + disk.freeGiB + ' GiB of ' + disk.totalGiB + ' GiB is free on ' + disk.path)
+      const rules = await decode(movieRules(users, disk), 'movie')
+      await createRuleGroup(library, 'movie', rules, { radarrSettingsId: radarr.id })
+    } else if (library.type === 'show' && sonarr && sonarrKey) {
+      const disk = await diskThreshold(sonarr.url, sonarrKey)
+      log('shows: act when less than ' + disk.freeGiB + ' GiB of ' + disk.totalGiB + ' GiB is free on ' + disk.path)
+      const rules = await decode(seasonRules(users, disk), 'season')
+      await createRuleGroup(library, 'season', rules, { sonarrSettingsId: sonarr.id })
+    } else {
+      log('skipping library "' + library.title + '" (' + library.type + ')')
+    }
+  }
+  return true
+}
+
+async function main() {
+  await waitForMaintainerr()
+  const sonarrUrl = env.SONARR_URL || 'http://sonarr_server_1:8989'
+  const radarrUrl = env.RADARR_URL || 'http://radarr_server_1:7878'
+  const sonarrKey = (env.SONARR_API_KEY || '').trim()
+  const radarrKey = (env.RADARR_API_KEY || '').trim()
+  await ensureArr('sonarr', 'Sonarr', sonarrUrl, sonarrKey)
+  await ensureArr('radarr', 'Radarr', radarrUrl, radarrKey)
+  await ensureSeerr(env.SEERR_URL || 'http://jellyseerr_server_1:5055', (env.SEERR_API_KEY || '').trim())
+
+  if (existsSync(RULES_MARKER)) {
+    log('default rules were created on an earlier start; nothing else to do')
+    return
+  }
+
+  let announced = false
+  for (;;) {
+    if (await jellyfinReady().catch(() => false)) break
+    if (!announced) {
+      log('waiting for Jellyfin: open Maintainerr > Settings > Jellyfin, use URL ' +
+        (env.JELLYFIN_URL || 'http://jellyfin_server_1:8096') +
+        ' and paste an API key from Jellyfin > Dashboard > API Keys')
+      announced = true
+    }
+    await sleep(60000)
+  }
+
+  for (let attempt = 1; ; attempt++) {
+    try {
+      if (await createRules(radarrKey, sonarrKey)) break
+    } catch (error) {
+      log('creating rules failed (attempt ' + attempt + '): ' + error.message)
+      if (attempt >= 10) throw error
+    }
+    await sleep(60000)
+  }
+  writeFileSync(RULES_MARKER, new Date().toISOString() + '\n')
+  log('done')
+}
+
+main().catch((error) => {
+  log('error: ' + error.message)
+  process.exit(1)
+})
